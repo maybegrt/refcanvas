@@ -65,6 +65,7 @@ pub fn update_cursor(
     interaction: Res<Interaction>,
     pointer: Res<Pointer>,
     selection: Res<Selection>,
+    tool: Res<super::draw::DrawTool>,
     q: NodeQ,
 ) {
     let (window_entity, window) = *window;
@@ -95,19 +96,19 @@ pub fn update_cursor(
         })
     } else {
         match &*interaction {
-            Interaction::Scale(drag) => {
-                Some(resize_cursor(handle_dir(&drag.frame, drag.handle)))
-            }
+            Interaction::Scale(drag) => Some(resize_cursor(handle_dir(&drag.frame, drag.handle))),
             Interaction::Move { .. } | Interaction::PendingMove { .. } => {
                 Some(SystemCursorIcon::Move)
             }
             Interaction::Rotate(_) => Some(SystemCursorIcon::Crosshair),
             // Nothing special under the pointer: reset to the default arrow,
             // otherwise the handle cursor would stay stuck.
-            _ => Some(
-                hover_cursor(window, camera, cam_tf, &selection, &q)
+            _ => Some(match tool.tool {
+                super::draw::Tool::Brush => SystemCursorIcon::Crosshair,
+                super::draw::Tool::Eraser => SystemCursorIcon::Cell,
+                super::draw::Tool::Select => hover_cursor(window, camera, cam_tf, &selection, &q)
                     .unwrap_or(SystemCursorIcon::Default),
-            ),
+            }),
         }
     };
 

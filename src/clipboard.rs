@@ -97,6 +97,7 @@ impl SystemClipboard {
 enum PastePayload {
     Files(Vec<PathBuf>),
     Image(image::RgbaImage),
+    Urls(Vec<String>),
     Empty,
 }
 
@@ -207,8 +208,7 @@ fn poll_copy(mut sc: ResMut<SystemClipboard>) {
     let Some((fingerprint, payload)) = entry else {
         return;
     };
-    sc.history
-        .retain(|(known, _)| !known.matches(&fingerprint));
+    sc.history.retain(|(known, _)| !known.matches(&fingerprint));
     sc.history.push_front((fingerprint, payload));
     sc.history.truncate(COPY_HISTORY);
 }
@@ -230,8 +230,16 @@ fn poll_paste(mut sc: ResMut<SystemClipboard>, mut queue: ResMut<ImportQueue>) {
             info!("clipboard: pasted {} file(s)", paths.len());
             import::enqueue_paths(&mut queue, at, paths);
         }
+        PastePayload::Urls(urls) => {
+            info!("clipboard: pasted {} url(s)", urls.len());
+            import::enqueue_urls(&mut queue, at, urls);
+        }
         PastePayload::Image(image) => {
-            info!("clipboard: pasted image ({}×{})", image.width(), image.height());
+            info!(
+                "clipboard: pasted image ({}×{})",
+                image.width(),
+                image.height()
+            );
             let fingerprint = Fingerprint::of(&image);
             let payload = sc
                 .history
@@ -244,6 +252,23 @@ fn poll_paste(mut sc: ResMut<SystemClipboard>, mut queue: ResMut<ImportQueue>) {
             info!("clipboard: nothing to paste, copy an image or files first");
         }
     }
+}
+
+/// Copy a short string (a source URL) without blocking the frame. Wayland's
+/// clipboard server can stall the caller, so this runs on its own thread.
+pub fn copy_text(text: String) {
+    std::thread::spawn(move || {
+        let mut cb = match arboard::Clipboard::new() {
+            Ok(cb) => cb,
+            Err(err) => {
+                warn!("clipboard: cannot open the system clipboard: {err}");
+                return;
+            }
+        };
+        if let Err(err) = cb.set_text(text) {
+            warn!("clipboard: failed to copy text: {err}");
+        }
+    });
 }
 
 /// Put an RGBA image on the clipboard. Runs on a worker: arboard encodes it
@@ -298,6 +323,15 @@ fn read_clipboard() -> PastePayload {
             }
         }
         Err(err) => trace!("clipboard: no image data ({err})"),
+    }
+
+    // A bare http(s) URL (or one per line) is downloaded into the project.
+    // A sentence that merely contains a URL is not.
+    if let Ok(text) = cb.get_text() {
+        let urls = crate::project::web::parse_pasted_urls(&text);
+        if !urls.is_empty() {
+            return PastePayload::Urls(urls);
+        }
     }
 
     // Last resort: text that names files ("Copy location", a path pasted
@@ -375,8 +409,10 @@ mod tests {
 
     #[test]
     fn fingerprint_rejects_a_different_picture() {
-        assert!(!Fingerprint::of(&image([120, 60, 30, 255]))
-            .matches(&Fingerprint::of(&image([30, 200, 30, 255]))));
+        assert!(
+            !Fingerprint::of(&image([120, 60, 30, 255]))
+                .matches(&Fingerprint::of(&image([30, 200, 30, 255])))
+        );
     }
 
     fn export(center: Vec2, size: Vec2, rot: f32, z: f32) -> ExportNode {
@@ -395,7 +431,12 @@ mod tests {
     fn copied_size_matches_the_flattened_bounds() {
         // A rotated image is flattened into its axis-aligned bounds, so the
         // restore size must be the AABB, not the pre-rotation size.
-        let node = export(Vec2::ZERO, Vec2::splat(100.0), std::f32::consts::FRAC_PI_4, 3.0);
+        let node = export(
+            Vec2::ZERO,
+            Vec2::splat(100.0),
+            std::f32::consts::FRAC_PI_4,
+            3.0,
+        );
         let payload = CopyPayload::from_export(&[node]);
         let expected = 100.0 * 2.0_f32.sqrt();
         assert!((payload.size[0] - expected).abs() < 0.01);

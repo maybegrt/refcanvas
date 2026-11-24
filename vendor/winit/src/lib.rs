@@ -205,6 +205,7 @@ pub mod changelog;
 #[macro_use]
 pub mod error;
 mod cursor;
+mod dropped_text;
 pub mod event;
 pub mod event_loop;
 mod icon;
@@ -215,3 +216,5 @@ mod utils;
 pub mod window;
 
 pub mod platform;
+
+pub use dropped_text::take_dropped_text;

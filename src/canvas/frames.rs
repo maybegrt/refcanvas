@@ -8,7 +8,7 @@ use bevy::text::TextLayoutInfo;
 
 use super::camera::View;
 use super::hit::{self, point_inside};
-use super::node::{InactiveTab, CanvasNode, FrameLabel, FrameNode, NodeKind, Pose, TabOwner};
+use super::node::{CanvasNode, FrameLabel, FrameNode, InactiveTab, NodeKind, Pose, TabOwner};
 use super::selection::NodeQ;
 use crate::project::oplog::NodeId;
 use crate::project::tabs::Tabs;
@@ -78,6 +78,7 @@ pub fn spawn_frame(
     label: String,
     pose: Pose,
     z: f32,
+    link: Option<String>,
 ) -> Entity {
     let frame = commands
         .spawn((
@@ -88,6 +89,7 @@ pub fn spawn_frame(
                 }),
                 size: pose.size,
                 rotation: pose.rot,
+                link,
             },
             // Transparent here; `update_frame_colors` tints it with the
             // desktop accent (the theme can change at runtime).
@@ -158,13 +160,19 @@ pub fn update_frame_labels(
     tabs: Res<Tabs>,
     // `Without<FrameLabel>` makes this disjoint from the label query below
     // (both touch `Transform`): frame entities never carry the label marker.
-    frames: Query<(&CanvasNode, &TabOwner, &Transform), (Without<FrameLabel>, Without<InactiveTab>)>,
-    mut labels: Query<(
-        &FrameLabel,
-        &mut Transform,
-        &mut Visibility,
-        &TextLayoutInfo,
-    ), Without<InactiveTab>>,
+    frames: Query<
+        (&CanvasNode, &TabOwner, &Transform),
+        (Without<FrameLabel>, Without<InactiveTab>),
+    >,
+    mut labels: Query<
+        (
+            &FrameLabel,
+            &mut Transform,
+            &mut Visibility,
+            &TextLayoutInfo,
+        ),
+        Without<InactiveTab>,
+    >,
     mut hits: ResMut<FrameLabelHits>,
 ) {
     let wpp = (view.scale() as f32).max(1e-4);

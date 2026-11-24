@@ -540,13 +540,16 @@ impl EventProcessor {
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
             let (source_window, state) = if let Some(source_window) = self.dnd.source_window {
-                if let Some(Ok(ref path_list)) = self.dnd.result {
-                    for path in path_list {
+                if let Some(Ok(ref parsed)) = self.dnd.result {
+                    for path in &parsed.paths {
                         let event = Event::WindowEvent {
                             window_id,
                             event: WindowEvent::DroppedFile(path.clone()),
                         };
                         callback(&self.target, event);
+                    }
+                    for url in &parsed.urls {
+                        crate::dropped_text::push(url.clone());
                     }
                 }
                 (source_window, DndState::Accepted)
@@ -595,8 +598,8 @@ impl EventProcessor {
         self.dnd.result = None;
         if let Ok(mut data) = unsafe { self.dnd.read_data(window) } {
             let parse_result = self.dnd.parse_data(&mut data);
-            if let Ok(ref path_list) = parse_result {
-                for path in path_list {
+            if let Ok(ref parsed) = parse_result {
+                for path in &parsed.paths {
                     let event = Event::WindowEvent {
                         window_id,
                         event: WindowEvent::HoveredFile(path.clone()),

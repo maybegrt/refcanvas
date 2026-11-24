@@ -8,6 +8,7 @@ pub mod persist;
 pub mod store;
 pub mod sync;
 pub mod tabs;
+pub mod web;
 
 use bevy::prelude::*;
 

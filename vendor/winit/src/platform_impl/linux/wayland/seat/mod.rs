@@ -255,7 +255,7 @@ impl WinitState {
         })
     }
 
-    fn read_file_paths<F: Fn(&mut Self, PathBuf) + 'static>(
+    fn read_file_paths<F: Fn(&mut Self, DroppedItem) + 'static>(
         &self,
         read_pipe: ReadPipe,
         callback: F,
@@ -267,16 +267,22 @@ impl WinitState {
                 let file: &mut File = unsafe { file.get_mut() };
                 if file.read_to_string(&mut data).is_ok() {
                     for line in data.lines() {
-                        let line = line.trim();
+                        let line = line.trim().trim_matches(|c| c == '<' || c == '>');
                         // Copy: comment / empty lines are allowed in uri-lists.
                         if line.is_empty() || line.starts_with('#') {
                             continue;
                         }
                         if let Ok(url) = Url::parse(line) {
-                            if url.scheme() == "file" {
-                                if let Ok(path) = url.to_file_path() {
-                                    callback(state, path)
+                            match url.scheme() {
+                                "file" => {
+                                    if let Ok(path) = url.to_file_path() {
+                                        callback(state, DroppedItem::Path(path));
+                                    }
                                 }
+                                "http" | "https" => {
+                                    callback(state, DroppedItem::Url(line.to_string()));
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -286,6 +292,11 @@ impl WinitState {
             })
             .ok();
     }
+}
+
+pub(crate) enum DroppedItem {
+    Path(PathBuf),
+    Url(String),
 }
 
 sctk::delegate_seat!(WinitState);

@@ -265,7 +265,10 @@ pub fn apply_remote_changes(
                     let node = q.get(entity).map(|(_, _, node, _, _)| node).ok();
                     matches!(
                         node.map(|node| (&node.kind, saved.kind.as_str())),
-                        Some((NodeKind::Image(_), "image")) | Some((NodeKind::Frame(_), "frame"))
+                        Some((NodeKind::Image(_), "image"))
+                            | Some((NodeKind::Frame(_), "frame"))
+                            | Some((NodeKind::Text(_), "text"))
+                            | Some((NodeKind::Stroke(_), "stroke"))
                     )
                 };
                 if same_kind {
@@ -337,6 +340,7 @@ fn patch_entity(
     tf.rotation = Quat::from_rotation_z(saved.rot);
     node.size = Vec2::new(saved.w, saved.h);
     node.rotation = saved.rot;
+    node.link = saved.link.clone();
     sprite.custom_size = Some(node.size);
     sprite.flip_x = saved.flip_x;
     sprite.flip_y = saved.flip_y;
@@ -392,7 +396,40 @@ fn patch_entity(
             }
             img.data.crop = crop;
             img.data.px_scale = px_scale;
+            img.data.source_url = saved.source_url.clone();
+            img.data.strokes_hidden = saved.strokes_hidden;
+            img.data.strokes = saved
+                .strokes
+                .iter()
+                .map(|stroke| crate::canvas::node::ImageStroke {
+                    points: stroke.pts.iter().map(|p| Vec2::new(p[0], p[1])).collect(),
+                    width: stroke.width,
+                    color: stroke.color,
+                })
+                .collect();
             sprite.rect = Some(img.active_rect());
+        }
+        NodeKind::Text(text) => {
+            let body = saved.label.clone().unwrap_or_else(|| "Label".to_string());
+            let color = crate::canvas::palette::clamp_index(saved.color.unwrap_or(text.color));
+            if text.body != body {
+                text.body = body;
+                text.revision = text.revision.wrapping_add(1);
+                text.fit_wait = 2;
+            }
+            text.color = color;
+            // The saved box is the fitted size; don't measure it again.
+            text.fitted_revision = text.revision;
+        }
+        NodeKind::Stroke(stroke) => {
+            if let Some(stored) = saved.strokes.first() {
+                stroke.points = stored.pts.iter().map(|p| Vec2::new(p[0], p[1])).collect();
+                stroke.width = stored.width;
+                stroke.color = stored.color;
+            }
+            if let Some(space) = saved.stroke_space {
+                stroke.space = Vec2::new(space[0].max(1e-3), space[1].max(1e-3));
+            }
         }
         NodeKind::Frame(frame) => {
             let label = saved.label.clone().unwrap_or_else(|| "Frame".to_string());

@@ -32,6 +32,10 @@ under their own licenses, reproduced/referenced here for binary redistribution.
 
 ## Bundled fonts
 
+- `assets/fonts/IBMPlexSans-Regular.ttf` is **IBM Plex Sans** (Regular),
+  Copyright © 2017 IBM Corp., reserved font name "Plex", licensed under the
+  SIL Open Font License 1.1. The license text is
+  `assets/fonts/OFL-IBMPlexSans.txt`. Labels on the canvas use this face.
 - `epaint_default_fonts` (pulled in by `bevy_egui`) is licensed
   `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0`.
 - Bevy's built-in default font (`bevy_text`) ships under its bundled font

@@ -5,9 +5,13 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::core::{IUnknown, GUID, HRESULT};
-use windows_sys::Win32::Foundation::{DV_E_FORMATETC, HWND, POINTL, S_OK};
+use windows_sys::Win32::Foundation::{DV_E_FORMATETC, HGLOBAL, HWND, POINTL, S_OK};
 use windows_sys::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
-use windows_sys::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_NONE};
+use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows_sys::Win32::System::Ole::{
+    ReleaseStgMedium, CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_NONE,
+};
 use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 
 use tracing::debug;
@@ -93,7 +97,10 @@ impl FileDropHandler {
                 });
             })
         };
-        drop_handler.hovered_is_valid = hdrop.is_some();
+        // A browser drag is often a URL with no CF_HDROP. Accept it so the
+        // source actually delivers the drop; the URL is read in `Drop`.
+        let has_url = unsafe { !read_urls(pDataObj).is_empty() };
+        drop_handler.hovered_is_valid = hdrop.is_some() || has_url;
         drop_handler.cursor_effect =
             if drop_handler.hovered_is_valid { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
         unsafe {
@@ -139,6 +146,9 @@ impl FileDropHandler {
     ) -> HRESULT {
         use crate::event::WindowEvent::DroppedFile;
         let drop_handler = unsafe { Self::from_interface(this) };
+        for url in unsafe { read_urls(pDataObj) } {
+            crate::dropped_text::push(url);
+        }
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
                 drop_handler.send_event(Event::WindowEvent {
@@ -208,6 +218,93 @@ impl FileDropHandler {
             None
         }
     }
+}
+
+/// Clipboard formats a browser uses for a dragged URL. Wide ones are UTF-16.
+const URL_FORMATS: &[(&str, bool)] = &[
+    ("UniformResourceLocatorW", true),
+    ("text/x-moz-url", true),
+    ("text/uri-list", false),
+    ("UniformResourceLocator", false),
+];
+
+unsafe fn read_urls(data_obj: *const IDataObject) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, wide) in URL_FORMATS {
+        if let Some(text) = unsafe { read_named(data_obj, name, *wide) } {
+            push_url_text(&mut out, &text);
+        }
+    }
+    if let Some(text) = unsafe { read_format(data_obj, CF_UNICODETEXT as u16, true) } {
+        push_url_text(&mut out, &text);
+    }
+    out
+}
+
+fn push_url_text(out: &mut Vec<String>, text: &str) {
+    if text.len() > 8192 {
+        return;
+    }
+    for line in text.split(['\n', '\r', '\0']) {
+        let line = line.trim().trim_matches(|c| c == '<' || c == '>');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if (line.starts_with("http://") || line.starts_with("https://"))
+            && !out.iter().any(|have| have == line)
+        {
+            out.push(line.to_string());
+        }
+    }
+}
+
+unsafe fn read_named(data_obj: *const IDataObject, name: &str, wide: bool) -> Option<String> {
+    let mut utf16: Vec<u16> = name.encode_utf16().collect();
+    utf16.push(0);
+    let id = unsafe { RegisterClipboardFormatW(utf16.as_ptr()) } as u16;
+    if id == 0 {
+        return None;
+    }
+    unsafe { read_format(data_obj, id, wide) }
+}
+
+unsafe fn read_format(data_obj: *const IDataObject, format: u16, wide: bool) -> Option<String> {
+    let drop_format = FORMATETC {
+        cfFormat: format,
+        ptd: ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL as u32,
+    };
+    let mut medium = unsafe { std::mem::zeroed() };
+    let get_data = unsafe { (*(*data_obj).cast::<IDataObjectVtbl>()).GetData };
+    let hr = unsafe { get_data(data_obj as *mut _, &drop_format, &mut medium) };
+    if hr < 0 {
+        return None;
+    }
+    let text = unsafe { read_hglobal(medium.u.hGlobal, wide) };
+    unsafe { ReleaseStgMedium(&mut medium) };
+    text
+}
+
+unsafe fn read_hglobal(handle: HGLOBAL, wide: bool) -> Option<String> {
+    let ptr = unsafe { GlobalLock(handle) };
+    if ptr.is_null() {
+        return None;
+    }
+    let bytes = unsafe { GlobalSize(handle) };
+    let text = if wide {
+        let units = bytes / 2;
+        let data = unsafe { std::slice::from_raw_parts(ptr as *const u16, units) };
+        let end = data.iter().position(|c| *c == 0).unwrap_or(units);
+        String::from_utf16_lossy(&data[..end])
+    } else {
+        let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, bytes) };
+        let end = data.iter().position(|c| *c == 0).unwrap_or(bytes);
+        String::from_utf8_lossy(&data[..end]).into_owned()
+    };
+    unsafe { GlobalUnlock(handle) };
+    Some(text)
 }
 
 impl FileDropHandlerData {

@@ -13,6 +13,52 @@ A GPU-accelerated infinite canvas for digital artists, written in Rust + Bevy 0.
 - Free up VRAM whenever possible (More memory for DCC)
 - Local-first design without relying on the Cloud
 
+## This fork
+
+Personal build for collecting references and Midjourney concept art. Projects stay in the same folder format (append-only JSONL journal, checkpoints, content-hashed images, 512px previews). Older projects still open: the new fields are optional.
+
+### Doodle
+
+- **B** brush, **E** eraser, **V** (or Escape) back to select. The same three buttons sit in the bar at the bottom of the window.
+- One smooth brush. Width is uniform along the stroke (no pressure). **[** and **]** change it, in screen pixels at the moment you draw.
+- Sixteen VGA colors in that bar. Strokes are stored as simplified point lists (Chaikin, then Ramer–Douglas–Peucker) and drawn as meshes.
+- A stroke that **starts on an image** sticks to that image: it moves, scales, rotates, flips and crops with it, and is deleted with it. A stroke on empty canvas is its own node (select it and press Delete, or use the eraser).
+- Right-click an image → **Hide strokes** / **Show strokes** (saved with the project, visible by default).
+- **Hide strokes** / **Show strokes** in the bottom-right corner hides every stroke. That choice is remembered on this machine.
+
+### Labels
+
+- **T**, or right-click empty canvas → **Add label**. A short single- or multi-line label in IBM Plex Sans (the same 16 colors).
+- Double-click to edit. Enter inserts a line; **Ctrl+Enter** or clicking away commits; Escape cancels.
+- Move, scale, rotate and delete it like any other node. Scaling is how you change the size.
+- With one label selected, a color in the bottom bar (or the right-click swatches) recolors it.
+
+### Web images
+
+- Paste an `http`/`https` URL with **Ctrl+V** (one URL per line is fine). The file is downloaded in the background into the project's `images/` store and placed as a node. The address is stored on the node.
+- Dropping an image file still works. Dropping a URL (`text/uri-list`, or the URL text some browsers send) downloads it the same way.
+- A failed download shows an orange line in the status bar. The frame is not blocked.
+- Right-click an image that has a source address → **Copy source URL**.
+
+### Links
+
+- Right-click an image, frame or label → **Set link…**. `https://…` and app schemes such as `notion://…` are both fine.
+- **Open link** in that menu opens it with the OS handler. Double-clicking an image or a frame that has a link does the same (double-clicking a label still edits the words).
+- A small dot in the top-right corner of a node means it has a link.
+
+### Building on Windows
+
+From a checkout, with the MSVC toolchain and a Vulkan driver (the RTX 5070 Ti's current driver is enough):
+
+```
+cargo build --release
+target\release\refcanvas.exe
+```
+
+Rust 1.85 or newer (edition 2024). This tree builds on Linux with the same command (`target/release/refcanvas`). A Windows `.exe` is not produced by the Linux build.
+
+Browser drag-and-drop and `notion://` links need a check on the Windows machine; see the notes in the pull request. GIF animation, video and rich text are still out of scope.
+
 ## Features
 
 - Drag & drop images
@@ -49,7 +95,7 @@ A GPU-accelerated infinite canvas for digital artists, written in Rust + Bevy 0.
 ## Not Yet Supported / Planned
 
 - OpenColorIO
-- Texts
+- Rich text (plain labels are supported; see above)
 - Animated GIF
 - Videos
 - Compare A/B test slider
