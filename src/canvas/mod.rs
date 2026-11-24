@@ -2,17 +2,23 @@
 
 pub mod camera;
 pub mod cursor;
+pub mod draw;
 pub mod export;
 pub mod frames;
 pub mod gizmos;
 pub mod grid;
 pub mod hit;
+pub mod ink;
 pub mod keyboard;
+pub mod link;
 pub mod lod;
 pub mod manipulate;
 pub mod node;
+pub mod palette;
 pub mod selection;
 pub mod snap;
+pub mod stroke;
+pub mod text;
 pub mod touch;
 pub mod undo;
 
@@ -134,88 +140,94 @@ pub struct CanvasPlugin;
 
 impl Plugin for CanvasPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(grid::GridPlugin)
-            .init_resource::<camera::View>()
-            .init_resource::<selection::Selection>()
-            .init_resource::<selection::Interaction>()
-            .init_resource::<manipulate::ZCounter>()
-            .init_resource::<grid::GridFade>()
-            .init_resource::<undo::UndoStack>()
-            .init_resource::<camera::ViewMotion>()
-            .init_resource::<camera::WheelGesture>()
-            .init_resource::<lod::FrameCounter>()
-            .init_resource::<lod::GpuTextureState>()
-            .init_resource::<lod::TexTuning>()
-            .init_resource::<lod::FullLoadWarns>()
-            .init_resource::<frames::FrameLabelHits>()
-            .init_resource::<frames::FrameRename>()
-            .init_resource::<ChordMemory>()
-            .init_resource::<touch::Pointer>()
-            .init_resource::<touch::TouchState>()
-            .init_resource::<touch::Inertia>()
-            .init_resource::<lod::TexBudget>()
-            .add_systems(Last, lod::park_inactive_meshes)
-            .add_systems(
-                Startup,
-                (
-                    camera::setup_camera,
-                    gizmos::configure_gizmos,
-                    gizmos::spawn_marquee_fill,
-                ),
+        app.add_plugins((
+            grid::GridPlugin,
+            ink::InkPlugin,
+            text::TextPlugin,
+            draw::DrawPlugin,
+        ))
+        .init_resource::<camera::View>()
+        .init_resource::<selection::Selection>()
+        .init_resource::<selection::Interaction>()
+        .init_resource::<manipulate::ZCounter>()
+        .init_resource::<grid::GridFade>()
+        .init_resource::<undo::UndoStack>()
+        .init_resource::<camera::ViewMotion>()
+        .init_resource::<camera::WheelGesture>()
+        .init_resource::<lod::FrameCounter>()
+        .init_resource::<lod::GpuTextureState>()
+        .init_resource::<lod::TexTuning>()
+        .init_resource::<lod::FullLoadWarns>()
+        .init_resource::<frames::FrameLabelHits>()
+        .init_resource::<frames::FrameRename>()
+        .init_resource::<ChordMemory>()
+        .init_resource::<touch::Pointer>()
+        .init_resource::<touch::TouchState>()
+        .init_resource::<touch::Inertia>()
+        .init_resource::<lod::TexBudget>()
+        .add_systems(Last, lod::park_inactive_meshes)
+        .add_systems(
+            Startup,
+            (
+                camera::setup_camera,
+                gizmos::configure_gizmos,
+                gizmos::spawn_marquee_fill,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
+                lod::tick_frame,
+                track_chords,
+                touch::touch_input,
+                touch::apply_inertia,
+                camera::track_wheel_gesture,
+                camera::view_input,
+                // Before `view_smooth`: focus/arrow hops must set their
+                // target (and thus the ease's redraw request) within the
+                // same frame, or the idle loop can go back to sleep
+                // before the glide starts.
+                keyboard::shortcuts,
+                camera::view_smooth,
+                camera::track_view_motion,
+                undo::undo_redo,
+                selection::pointer_events,
+                selection::apply_interaction,
             )
-            .add_systems(
-                Update,
-                (
-                    lod::tick_frame,
-                    track_chords,
-                    touch::touch_input,
-                    touch::apply_inertia,
-                    camera::track_wheel_gesture,
-                    camera::view_input,
-                    // Before `view_smooth`: focus/arrow hops must set their
-                    // target (and thus the ease's redraw request) within the
-                    // same frame, or the idle loop can go back to sleep
-                    // before the glide starts.
-                    keyboard::shortcuts,
-                    camera::view_smooth,
-                    camera::track_view_motion,
-                    undo::undo_redo,
-                    selection::pointer_events,
-                    selection::apply_interaction,
-                )
-                    .chain()
-                    .in_set(CanvasSet),
+                .chain()
+                .in_set(CanvasSet),
+        )
+        .add_systems(
+            Update,
+            (
+                selection::prune_selection,
+                lod::ensure_full_textures,
+                lod::collect_full_textures,
+                lod::bind_pending_full_textures,
+                lod::evict_full_textures,
+                lod::log_vram_stats,
+                lod::release_cpu_image_data,
+                lod::update_texture_samplers,
+                lod::requeue_on_z_change,
+                gizmos::draw_pending_loads,
+                gizmos::update_marquee_fill,
+                gizmos::draw_selection,
+                frames::update_frame_colors,
+                frames::update_frame_labels,
+                frames::draw_frame_borders,
+                link::draw_link_markers,
+                grid::update_grid,
             )
-            .add_systems(
-                Update,
-                (
-                    selection::prune_selection,
-                    lod::ensure_full_textures,
-                    lod::collect_full_textures,
-                    lod::bind_pending_full_textures,
-                    lod::evict_full_textures,
-                    lod::log_vram_stats,
-                    lod::release_cpu_image_data,
-                    lod::update_texture_samplers,
-                    lod::requeue_on_z_change,
-                    gizmos::draw_pending_loads,
-                    gizmos::update_marquee_fill,
-                    gizmos::draw_selection,
-                    frames::update_frame_colors,
-                    frames::update_frame_labels,
-                    frames::draw_frame_borders,
-                    grid::update_grid,
-                )
-                    .chain()
-                    .in_set(CanvasLateSet)
-                    .after(CanvasSet),
-            )
-            // Cursor shapes run after egui's own cursor handling, so canvas
-            // cursors win over the canvas and egui's win over its UI.
-            .add_systems(
-                PostUpdate,
-                cursor::update_cursor.after(bevy_egui::EguiPostUpdateSet::PostProcessOutput),
-            );
+                .chain()
+                .in_set(CanvasLateSet)
+                .after(CanvasSet),
+        )
+        // Cursor shapes run after egui's own cursor handling, so canvas
+        // cursors win over the canvas and egui's win over its UI.
+        .add_systems(
+            PostUpdate,
+            cursor::update_cursor.after(bevy_egui::EguiPostUpdateSet::PostProcessOutput),
+        );
 
         // Render-world half of the texture-upload bookkeeping (see
         // `lod::GpuTextureState`); no-op without a render app.

@@ -21,7 +21,8 @@ pub enum DndState {
 pub enum DndDataParseError {
     EmptyData,
     InvalidUtf8(#[allow(dead_code)] Utf8Error),
-    HostnameSpecified(#[allow(dead_code)] String),
+    #[allow(dead_code)]
+    HostnameSpecified(String),
     UnexpectedProtocol(#[allow(dead_code)] String),
     UnresolvablePath(#[allow(dead_code)] io::Error),
 }
@@ -46,7 +47,15 @@ pub struct Dnd {
     // Populated by XdndPosition event handler
     pub source_window: Option<xproto::Window>,
     // Populated by SelectionNotify event handler (triggered by XdndPosition event handler)
-    pub result: Option<Result<Vec<PathBuf>, DndDataParseError>>,
+    pub result: Option<Result<ParsedDrop, DndDataParseError>>,
+}
+
+/// Files become `DroppedFile`. http(s) URLs are handed to the application
+/// through [`crate::take_dropped_text`] when the drop completes.
+#[derive(Debug)]
+pub struct ParsedDrop {
+    pub paths: Vec<PathBuf>,
+    pub urls: Vec<String>,
 }
 
 impl Dnd {
@@ -143,32 +152,38 @@ impl Dnd {
         self.xconn.get_property(window, atoms[XdndSelection], atoms[TextUriList])
     }
 
-    pub fn parse_data(&self, data: &mut [c_uchar]) -> Result<Vec<PathBuf>, DndDataParseError> {
-        if !data.is_empty() {
-            let mut path_list = Vec::new();
-            let decoded = percent_decode(data).decode_utf8()?.into_owned();
-            for uri in decoded.split("\r\n").filter(|u| !u.is_empty()) {
-                // The format is specified as protocol://host/path
-                // However, it's typically simply protocol:///path
-                let path_str = if uri.starts_with("file://") {
-                    let path_str = uri.replace("file://", "");
-                    if !path_str.starts_with('/') {
-                        // A hostname is specified
-                        // Supporting this case is beyond the scope of my mental health
-                        return Err(DndDataParseError::HostnameSpecified(path_str));
-                    }
-                    path_str
-                } else {
-                    // Only the file protocol is supported
-                    return Err(DndDataParseError::UnexpectedProtocol(uri.to_owned()));
-                };
-
-                let path = Path::new(&path_str).canonicalize()?;
-                path_list.push(path);
-            }
-            Ok(path_list)
-        } else {
-            Err(DndDataParseError::EmptyData)
+    pub fn parse_data(&self, data: &mut [c_uchar]) -> Result<ParsedDrop, DndDataParseError> {
+        if data.is_empty() {
+            return Err(DndDataParseError::EmptyData);
         }
+        // Don't percent-decode the whole buffer: an http URL may contain
+        // `%20` that must stay encoded. File paths are decoded on their own.
+        let text = String::from_utf8_lossy(data);
+        let mut paths = Vec::new();
+        let mut urls = Vec::new();
+        for uri in text.split(['\r', '\n']) {
+            let uri = uri.trim();
+            if uri.is_empty() || uri.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = uri.strip_prefix("file://") {
+                let decoded = percent_decode(rest.as_bytes()).decode_utf8()?.into_owned();
+                if !decoded.starts_with('/') {
+                    // A hostname is specified. Skip it so a mixed drop can
+                    // still deliver the other entries.
+                    continue;
+                }
+                match Path::new(&decoded).canonicalize() {
+                    Ok(path) => paths.push(path),
+                    Err(_) => continue,
+                }
+            } else if uri.starts_with("http://") || uri.starts_with("https://") {
+                urls.push(uri.to_string());
+            }
+        }
+        if paths.is_empty() && urls.is_empty() {
+            return Err(DndDataParseError::UnexpectedProtocol(text.into_owned()));
+        }
+        Ok(ParsedDrop { paths, urls })
     }
 }

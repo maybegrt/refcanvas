@@ -48,6 +48,8 @@ enum ImportSource {
         image: image::RgbaImage,
         placement: Option<PastedPlacement>,
     },
+    /// Downloaded on the worker. The URL is stored on the node.
+    Url(String),
 }
 
 /// Placement to restore for a pasted clipboard image. The pixels are the
@@ -65,6 +67,7 @@ impl ImportSource {
         match self {
             ImportSource::File(path) => path.clone(),
             ImportSource::Pixels { name, .. } => PathBuf::from(name),
+            ImportSource::Url(url) => PathBuf::from(url),
         }
     }
 }
@@ -86,6 +89,8 @@ struct Incoming {
     result: anyhow::Result<ImportedImage>,
     /// Set for clipboard pastes that carry an in-app placement.
     placement: Option<PastedPlacement>,
+    /// This import was a URL, so a failure should be visible, not just logged.
+    announce: bool,
 }
 
 struct ImportedImage {
@@ -96,6 +101,7 @@ struct ImportedImage {
     natural: UVec2,
     preview_size: UVec2,
     preview: Image,
+    source_url: Option<String>,
 }
 
 impl ImportQueue {
@@ -136,6 +142,17 @@ pub fn enqueue_paths(queue: &mut ImportQueue, spawn_center: Vec2, paths: Vec<Pat
 /// `placement` is the display size and stacking order recorded when the copy
 /// came from refcanvas. Rotation, flips and crop are already baked into the
 /// pasted pixels by the export step, so they must not be applied again.
+/// Queue http(s) URLs. Each one is downloaded on a worker, then stored like
+/// any other import. Failures are reported on the status line.
+pub fn enqueue_urls(queue: &mut ImportQueue, spawn_center: Vec2, urls: Vec<String>) {
+    let sources = urls
+        .into_iter()
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .map(ImportSource::Url)
+        .collect();
+    enqueue_sources(queue, spawn_center, sources);
+}
+
 pub fn enqueue_clipboard_image(
     queue: &mut ImportQueue,
     spawn_center: Vec2,
@@ -192,7 +209,10 @@ fn collect_images(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     };
     let mut items: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+        .filter(|p| {
+            !p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
         .collect();
     items.sort();
     for p in items {
@@ -224,7 +244,15 @@ pub fn handle_dropped_files(
             paths.push(path_buf.clone());
         }
     }
-    if paths.is_empty() {
+    // winit only emits file paths. Browser drags that are a URL (uri-list,
+    // UniformResourceLocator, plain text) are queued beside that by the
+    // vendored drop handlers. A URL wins over a same-gesture temp file so
+    // the node keeps the source address.
+    let mut urls = Vec::new();
+    for blob in winit::take_dropped_text() {
+        urls.extend(super::web::parse_drop_urls(&blob));
+    }
+    if paths.is_empty() && urls.is_empty() {
         return;
     }
     let (camera, cam_tf) = *camera;
@@ -232,6 +260,10 @@ pub fn handle_dropped_files(
         .cursor_position()
         .and_then(|c| camera.viewport_to_world_2d(cam_tf, c).ok())
         .unwrap_or_else(|| view.center.as_vec2());
+    if !urls.is_empty() {
+        enqueue_urls(&mut queue, spawn_center, urls);
+        return;
+    }
     enqueue_paths(&mut queue, spawn_center, paths);
 }
 
@@ -287,14 +319,16 @@ pub fn pump_import_queue(mut queue: ResMut<ImportQueue>, store: Res<ProjectStore
         // source moves onto the worker.
         let placement = match &source {
             ImportSource::Pixels { placement, .. } => *placement,
-            ImportSource::File(_) => None,
+            ImportSource::File(_) | ImportSource::Url(_) => None,
         };
+        let announce_url = matches!(source, ImportSource::Url(_));
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let result = import_one(&store, source);
             Incoming {
                 index,
                 result,
                 placement,
+                announce: announce_url,
             }
         });
         queue.in_flight.push(task);
@@ -307,6 +341,8 @@ pub fn collect_imports(
     mut images: ResMut<Assets<Image>>,
     mut zc: ResMut<ZCounter>,
     mut undo: ResMut<UndoStack>,
+    mut notices: ResMut<crate::feedback::Notices>,
+    time: Res<Time>,
     tabs: Res<Tabs>,
 ) {
     let mut done: Vec<Incoming> = Vec::new();
@@ -378,13 +414,26 @@ pub fn collect_imports(
                     preview_pending: false, // the preview arrives with the node
                     crop,
                     px_scale,
+                    source_url: imported.source_url.clone(),
+                    strokes: Vec::new(),
+                    strokes_hidden: false,
                 };
                 let data_for_record = data.clone();
-                let entity =
-                    spawn_image_node_with_z(&mut commands, data, pose, tab_id, true, z, false, false);
+                let entity = spawn_image_node_with_z(
+                    &mut commands,
+                    data,
+                    pose,
+                    tab_id,
+                    true,
+                    z,
+                    false,
+                    false,
+                    None,
+                );
                 imported_records.push(NodeRecord {
                     entity,
                     tab_id,
+                    link: None,
                     data: NodeData::Image(data_for_record),
                     snap: NodeSnapshot {
                         pose,
@@ -396,7 +445,20 @@ pub fn collect_imports(
                     },
                 });
             }
-            Err(err) => warn!("import failed: {err:#}"),
+            Err(err) => {
+                warn!("import failed: {err:#}");
+                if incoming.announce {
+                    let msg = err
+                        .chain()
+                        .next()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "download failed".to_string());
+                    notices.push(
+                        format!("Could not import image: {msg}"),
+                        time.elapsed_secs(),
+                    );
+                }
+            }
         }
     }
     if !imported_records.is_empty() {
@@ -425,7 +487,7 @@ fn grid_cell_offset(index: usize, total: usize) -> Vec2 {
 // ---------------------------------------------------------------------------
 
 fn import_one(store: &ProjectStore, source: ImportSource) -> anyhow::Result<ImportedImage> {
-    let (bytes, dyn_img, ext, orig_name) = match source {
+    let (bytes, dyn_img, ext, orig_name, source_url) = match source {
         ImportSource::File(path) => {
             let bytes = std::fs::read(&path)?;
             let ext = path
@@ -438,7 +500,25 @@ fn import_one(store: &ProjectStore, source: ImportSource) -> anyhow::Result<Impo
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "image".to_string());
             let dyn_img = image::load_from_memory(&bytes)?;
-            (bytes, dyn_img, ext, orig_name)
+            (bytes, dyn_img, ext, orig_name, None)
+        }
+        ImportSource::Url(url) => {
+            let downloaded =
+                crate::project::web::download_image(&url).map_err(|err| anyhow::anyhow!(err))?;
+            let ext = downloaded
+                .filename
+                .rsplit('.')
+                .next()
+                .unwrap_or("png")
+                .to_ascii_lowercase();
+            let dyn_img = image::load_from_memory(&downloaded.bytes)?;
+            (
+                downloaded.bytes,
+                dyn_img,
+                ext,
+                downloaded.filename,
+                Some(url),
+            )
         }
         ImportSource::Pixels { name, image, .. } => {
             // Clipboard pixels have no source file: store them as PNG.
@@ -448,6 +528,7 @@ fn import_one(store: &ProjectStore, source: ImportSource) -> anyhow::Result<Impo
                 image::DynamicImage::ImageRgba8(image),
                 "png".to_string(),
                 name,
+                None,
             )
         }
     };
@@ -485,6 +566,7 @@ fn import_one(store: &ProjectStore, source: ImportSource) -> anyhow::Result<Impo
         natural,
         preview_size,
         preview: to_bevy_image(preview_img),
+        source_url,
     })
 }
 
@@ -505,7 +587,10 @@ fn encode_png(image: &image::RgbaImage) -> anyhow::Result<Vec<u8>> {
 pub fn write_preview_cache(dir: &std::path::Path, short: &str, img: &image::DynamicImage) {
     let _ = std::fs::create_dir_all(dir);
     if img.color().has_alpha() {
-        let _ = img.save_with_format(dir.join(format!("{short}_512.png")), image::ImageFormat::Png);
+        let _ = img.save_with_format(
+            dir.join(format!("{short}_512.png")),
+            image::ImageFormat::Png,
+        );
     } else {
         let path = dir.join(format!("{short}_512.jpg"));
         if let Ok(file) = std::fs::File::create(path) {

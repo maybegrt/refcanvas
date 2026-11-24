@@ -9,7 +9,7 @@ use super::egui_pointer_busy;
 use super::frames::{FrameLabelHits, FrameRename, LABEL_DOUBLE_CLICK};
 use super::hit::{self, HitKind};
 use super::manipulate::{self, RotateDrag, ScaleDrag, ZCounter, current_pose};
-use super::node::{InactiveTab, CanvasNode, NodeKind, NodeSnapshot, Pose, TabOwner};
+use super::node::{CanvasNode, InactiveTab, NodeKind, NodeSnapshot, Pose, TabOwner};
 use super::touch::{Pointer, TOUCH_DRAG_THRESHOLD_PX};
 use super::undo::{UndoEntry, UndoStack, snapshot_of};
 use crate::project::tabs::Tabs;
@@ -195,6 +195,22 @@ pub fn pick_topmost(
     for (e, _) in items {
         if let Ok((_, tf, _, node)) = q.get(e) {
             let pose = current_pose(tf, node);
+            // A free stroke's box is mostly empty. Hit the ink, then keep
+            // looking so a click beside the line can still reach the image
+            // underneath.
+            if let NodeKind::Stroke(stroke) = &node.kind {
+                if super::stroke::hit_free_stroke(
+                    stroke,
+                    pose.center,
+                    pose.rot,
+                    pose.size,
+                    cursor_world,
+                    slop,
+                ) {
+                    return Some((e, pose));
+                }
+                continue;
+            }
             // A frame's label is chrome sitting outside its body: treat a
             // click on the text as a click on the frame.
             let on_label = label_hits
@@ -283,6 +299,8 @@ pub fn pointer_events(
     mut undo: ResMut<UndoStack>,
     chords: Chords,
     mut rename: ResMut<FrameRename>,
+    mut text_edit: ResMut<super::text::TextEdit>,
+    tool: Res<super::draw::DrawTool>,
     tabs: Res<Tabs>,
     label_hits: Res<FrameLabelHits>,
     q_own: Query<(Entity, &TabOwner), Without<InactiveTab>>,
@@ -322,6 +340,11 @@ pub fn pointer_events(
     }
 
     if !pointer.just_pressed || egui_busy || (pointer.is_touch && pointer.touch_pan) {
+        return;
+    }
+    // Brush and eraser own the primary button. Space+drag still pans; that
+    // path returns just below, and the camera reads the mouse itself.
+    if tool.tool != super::draw::Tool::Select && !pointer.is_touch {
         return;
     }
     let shift = crate::canvas::shift_down(&keys, &chords.mem, chords.frame.0);
@@ -442,6 +465,33 @@ pub fn pointer_events(
         ) {
             *interaction = Interaction::Idle;
             return;
+        }
+        let now = std::time::Instant::now();
+        let double = text_edit
+            .last_press
+            .is_some_and(|(t, e)| e == entity && now.duration_since(t) <= LABEL_DOUBLE_CLICK);
+        text_edit.last_press = Some((now, entity));
+        if double {
+            if let Ok((_, _, _, node)) = q.get(entity) {
+                if node.kind.is_text() {
+                    if let NodeKind::Text(text) = &node.kind {
+                        text_edit.target = Some(entity);
+                        text_edit.text = text.body.clone();
+                        text_edit.focus_me = true;
+                        text_edit.had_focus = false;
+                        selection.nodes = vec![entity];
+                        *interaction = Interaction::Idle;
+                        return;
+                    }
+                } else if node.link.is_some() && (node.image().is_some() || node.kind.is_frame()) {
+                    if let Some(link) = node.link.clone() {
+                        super::link::open_link(&link);
+                        selection.nodes = vec![entity];
+                        *interaction = Interaction::Idle;
+                        return;
+                    }
+                }
+            }
         }
         // Shift must not decide selection membership at press time: pressing
         // a selected node with Shift held then dragging moves the selection

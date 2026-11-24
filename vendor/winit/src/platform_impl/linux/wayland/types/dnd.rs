@@ -5,4 +5,5 @@ use wayland_client::protocol::wl_surface::WlSurface;
 pub struct DndOfferState {
     pub surface: WlSurface,
     pub paths: Vec<PathBuf>,
+    pub urls: Vec<String>,
 }

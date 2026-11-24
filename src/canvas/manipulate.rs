@@ -100,7 +100,7 @@ pub fn spawn_image_node(
 ) -> (Entity, f32) {
     let z = zc.next();
     (
-        spawn_image_node_with_z(commands, data, pose, tab_id, visible, z, false, false),
+        spawn_image_node_with_z(commands, data, pose, tab_id, visible, z, false, false, None),
         z,
     )
 }
@@ -114,6 +114,7 @@ pub fn spawn_image_node_with_z(
     z: f32,
     flip_x: bool,
     flip_y: bool,
+    link: Option<String>,
 ) -> Entity {
     let preview = data.preview.clone();
     // Preview tier: scale the crop into the preview texture's pixel space
@@ -135,6 +136,7 @@ pub fn spawn_image_node_with_z(
                 }),
                 size: pose.size,
                 rotation: pose.rot,
+                link,
             },
             Sprite {
                 image: preview,
@@ -437,8 +439,7 @@ fn apply_scale_factors(
             let prev = snap.crop.center();
             let cx = prev.x.clamp(crop_w * 0.5, natural.x - crop_w * 0.5);
             let cy = prev.y.clamp(crop_h * 0.5, natural.y - crop_h * 0.5);
-            img.data.crop =
-                Rect::from_center_size(Vec2::new(cx, cy), Vec2::new(crop_w, crop_h));
+            img.data.crop = Rect::from_center_size(Vec2::new(cx, cy), Vec2::new(crop_w, crop_h));
             img.data.px_scale = px;
             img.data.crop.size() * px
         } else {
@@ -457,12 +458,7 @@ fn apply_scale_factors(
 /// Ctrl + handle drag: precise crop. The dragged edge(s) move through the
 /// texture, clamped to the image; the opposite edge stays exactly anchored and
 /// the picture never rescales. Requires a single image node.
-pub fn apply_crop(
-    drag: &mut ScaleDrag,
-    cursor_world: Vec2,
-    wpp: f32,
-    q: &mut NodeQ,
-) {
+pub fn apply_crop(drag: &mut ScaleDrag, cursor_world: Vec2, wpp: f32, q: &mut NodeQ) {
     // Cropping is edge-precise by nature; no snapping guides here.
     drag.guide_x = None;
     drag.guide_y = None;
@@ -520,10 +516,7 @@ pub fn apply_crop(
 
         // Recompute size/center from the actual (clamped) crop so the
         // anchored edge stays exactly put.
-        let new_size = Vec2::new(
-            (new_max.x - new_min.x) * px,
-            (new_max.y - new_min.y) * px,
-        );
+        let new_size = Vec2::new((new_max.x - new_min.x) * px, (new_max.y - new_min.y) * px);
         let d_left = (new_min.x - start.min.x) * px;
         let d_right = (new_max.x - start.max.x) * px;
         let d_top = (start.min.y - new_min.y) * px;
@@ -531,9 +524,7 @@ pub fn apply_crop(
 
         let u = rot2(frame.rot) * Vec2::X;
         let v = rot2(frame.rot) * Vec2::Y;
-        let center = frame.center
-            + u * ((d_left + d_right) * 0.5)
-            + v * ((d_bottom + d_top) * 0.5);
+        let center = frame.center + u * ((d_left + d_right) * 0.5) + v * ((d_bottom + d_top) * 0.5);
 
         let pose = Pose {
             center,
@@ -555,7 +546,11 @@ pub struct RotateDrag {
     pub snapshots: Vec<(Entity, NodeSnapshot)>,
 }
 
-pub fn start_rotate_around(pivot: Vec2, cursor_world: Vec2, snapshots: Vec<(Entity, NodeSnapshot)>) -> RotateDrag {
+pub fn start_rotate_around(
+    pivot: Vec2,
+    cursor_world: Vec2,
+    snapshots: Vec<(Entity, NodeSnapshot)>,
+) -> RotateDrag {
     RotateDrag {
         pivot,
         start_angle: (cursor_world - pivot).to_angle(),
@@ -563,12 +558,7 @@ pub fn start_rotate_around(pivot: Vec2, cursor_world: Vec2, snapshots: Vec<(Enti
     }
 }
 
-pub fn apply_rotate(
-    drag: &RotateDrag,
-    cursor_world: Vec2,
-    snap: bool,
-    q: &mut NodeQ,
-) {
+pub fn apply_rotate(drag: &RotateDrag, cursor_world: Vec2, snap: bool, q: &mut NodeQ) {
     let angle = (cursor_world - drag.pivot).to_angle();
     let mut delta = angle - drag.start_angle;
     if snap {
@@ -624,11 +614,7 @@ pub fn delete_selection_undoable(
     }
 }
 
-pub fn select_all(
-    q: &NodeQ,
-    keep: impl Fn(Entity) -> bool,
-    selection: &mut Selection,
-) {
+pub fn select_all(q: &NodeQ, keep: impl Fn(Entity) -> bool, selection: &mut Selection) {
     selection.nodes = q.iter().map(|(e, ..)| e).filter(|e| keep(*e)).collect();
 }
 
@@ -645,27 +631,99 @@ pub fn duplicate_selection(
         let Ok((_, tf, _, node)) = q.get(*e) else {
             continue;
         };
-        let Some(img) = node.image() else {
-            continue;
-        };
         let mut pose = current_pose(tf, node);
         pose.center += offset;
         let z = zc.next();
-        let entity =
-            spawn_image_node_with_z(commands, img.data.clone(), pose, tab_id, true, z, false, false);
-        out.push(super::undo::NodeRecord {
-            entity,
-            tab_id,
-            data: super::undo::NodeData::Image(img.data.clone()),
-            snap: NodeSnapshot {
-                pose,
-                z,
-                flip_x: false,
-                flip_y: false,
-                crop: img.data.crop,
-                px_scale: img.data.px_scale,
-            },
-        });
+        let link = node.link.clone();
+        let record = match &node.kind {
+            NodeKind::Image(img) => {
+                let data = img.data.clone();
+                let entity = spawn_image_node_with_z(
+                    commands,
+                    data.clone(),
+                    pose,
+                    tab_id,
+                    true,
+                    z,
+                    false,
+                    false,
+                    link.clone(),
+                );
+                super::undo::NodeRecord {
+                    entity,
+                    tab_id,
+                    link,
+                    data: super::undo::NodeData::Image(data.clone()),
+                    snap: NodeSnapshot {
+                        pose,
+                        z,
+                        flip_x: false,
+                        flip_y: false,
+                        crop: data.crop,
+                        px_scale: data.px_scale,
+                    },
+                }
+            }
+            NodeKind::Text(text) => {
+                let body = text.body.clone();
+                let color = text.color;
+                let entity = super::text::spawn_text(
+                    commands,
+                    tab_id,
+                    true,
+                    None,
+                    body.clone(),
+                    color,
+                    pose,
+                    z,
+                    link.clone(),
+                    true,
+                );
+                super::undo::NodeRecord {
+                    entity,
+                    tab_id,
+                    link,
+                    data: super::undo::NodeData::Text { body, color },
+                    snap: NodeSnapshot {
+                        pose,
+                        z,
+                        flip_x: false,
+                        flip_y: false,
+                        crop: Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+                        px_scale: 1.0,
+                    },
+                }
+            }
+            NodeKind::Stroke(stroke) => {
+                let data = stroke.clone();
+                let entity = super::ink::spawn_stroke_node(
+                    commands,
+                    tab_id,
+                    true,
+                    None,
+                    data.clone(),
+                    pose,
+                    z,
+                    link.clone(),
+                );
+                super::undo::NodeRecord {
+                    entity,
+                    tab_id,
+                    link,
+                    data: super::undo::NodeData::Stroke(data),
+                    snap: NodeSnapshot {
+                        pose,
+                        z,
+                        flip_x: false,
+                        flip_y: false,
+                        crop: Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+                        px_scale: 1.0,
+                    },
+                }
+            }
+            NodeKind::Frame(_) => continue,
+        };
+        out.push(record);
     }
     out
 }

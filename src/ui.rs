@@ -29,6 +29,8 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ContextMenu>()
+            .init_resource::<crate::feedback::Notices>()
+            .init_resource::<crate::canvas::link::LinkEditor>()
             .init_resource::<AlwaysOnTop>()
             .add_systems(Update, apply_always_on_top)
             .add_systems(
@@ -39,7 +41,9 @@ impl Plugin for UiPlugin {
                     tab_bar,
                     hud,
                     context_menu_ui,
+                    drain_menu_pending,
                     frame_rename_ui,
+                    crate::canvas::link::edit_ui,
                 )
                     .chain(),
             );
@@ -91,6 +95,14 @@ struct ContextMenu {
     pos: Vec2,
     node: Option<Entity>,
     world: Vec2,
+    pending: Option<PendingMenu>,
+}
+
+enum PendingMenu {
+    EditLink(Entity),
+    EditText(Entity),
+    AddLabel(Vec2),
+    TextColor(Entity, u8),
 }
 
 #[derive(Default)]
@@ -168,6 +180,14 @@ enum MenuAction {
     Distribute(bool),
     ResetCrop,
     ResetSize,
+    CopySource,
+    OpenLink,
+    EditLink,
+    RemoveLink,
+    ToggleStrokes,
+    EditText,
+    AddLabel,
+    TextColor(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -261,6 +281,17 @@ fn context_menu_ui(
     let mut action: Option<MenuAction> = None;
     let pos = menu.pos;
     let has_node = menu.node.is_some();
+    let node_info = menu.node.and_then(|entity| {
+        q.get(entity).ok().map(|(_, _, _, node)| {
+            (
+                node.image().is_some(),
+                node.kind.is_text(),
+                node.image().and_then(|img| img.data.source_url.clone()),
+                node.link.clone(),
+                node.image().is_some_and(|img| img.data.strokes_hidden),
+            )
+        })
+    });
 
     egui::Area::new(egui::Id::new("refcanvas_ctx"))
         .fixed_pos(egui::pos2(pos.x, pos.y))
@@ -328,6 +359,60 @@ fn context_menu_ui(
                         }
                     }
                     ui.separator();
+                    if let Some((is_image, is_text, source, link, strokes_hidden)) = &node_info {
+                        if let Some(url) = source {
+                            if ui.button("Copy source URL").on_hover_text(url).clicked() {
+                                action = Some(MenuAction::CopySource);
+                            }
+                        }
+                        if link.is_some() {
+                            if ui.button("Open link").clicked() {
+                                action = Some(MenuAction::OpenLink);
+                            }
+                            if ui.button("Edit link…").clicked() {
+                                action = Some(MenuAction::EditLink);
+                            }
+                            if ui.button("Remove link").clicked() {
+                                action = Some(MenuAction::RemoveLink);
+                            }
+                        } else if ui.button("Set link…").clicked() {
+                            action = Some(MenuAction::EditLink);
+                        }
+                        if *is_image {
+                            let label = if *strokes_hidden {
+                                "Show strokes"
+                            } else {
+                                "Hide strokes"
+                            };
+                            if ui.button(label).clicked() {
+                                action = Some(MenuAction::ToggleStrokes);
+                            }
+                        }
+                        if *is_text {
+                            if ui.button("Edit label").clicked() {
+                                action = Some(MenuAction::EditText);
+                            }
+                            ui.label("Color");
+                            ui.horizontal_wrapped(|ui| {
+                                for i in 0..crate::canvas::palette::PALETTE_LEN {
+                                    let [r, g, b] =
+                                        crate::canvas::palette::PALETTE_SRGB[i as usize];
+                                    let fill = egui::Color32::from_rgb(r, g, b);
+                                    if ui
+                                        .add(
+                                            egui::Button::new("")
+                                                .fill(fill)
+                                                .min_size(egui::vec2(14.0, 14.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(MenuAction::TextColor(i));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    ui.separator();
                     if ui.button("Show in File Manager").clicked() {
                         action = Some(MenuAction::Reveal);
                     }
@@ -354,6 +439,9 @@ fn context_menu_ui(
                     }
                     if ui.button("Toggle Grid").clicked() {
                         action = Some(MenuAction::ToggleGrid);
+                    }
+                    if ui.button("Add label").clicked() {
+                        action = Some(MenuAction::AddLabel);
                     }
                 }
             });
@@ -421,6 +509,67 @@ fn context_menu_ui(
                             reveal_in_file_manager(&img.data.abs_path);
                         }
                     }
+                }
+            }
+            MenuAction::CopySource => {
+                if let Some(target) = menu.node
+                    && let Ok((_, _, _, node)) = q.get(target)
+                    && let Some(url) = node.image().and_then(|img| img.data.source_url.clone())
+                {
+                    crate::clipboard::copy_text(url);
+                }
+            }
+            MenuAction::OpenLink => {
+                if let Some(target) = menu.node
+                    && let Ok((_, _, _, node)) = q.get(target)
+                    && let Some(link) = node.link.clone()
+                {
+                    crate::canvas::link::open_link(&link);
+                }
+            }
+            MenuAction::EditLink => {
+                if let Some(target) = menu.node {
+                    menu.pending = Some(PendingMenu::EditLink(target));
+                }
+            }
+            MenuAction::RemoveLink => {
+                if let Some(target) = menu.node
+                    && let Ok((_, _, _, mut node)) = q.get_mut(target)
+                    && node.link.is_some()
+                {
+                    let before = node.link.take();
+                    undo.push(UndoEntry::Link {
+                        entity: target,
+                        before,
+                        after: None,
+                    });
+                }
+            }
+            MenuAction::ToggleStrokes => {
+                if let Some(target) = menu.node
+                    && let Ok((_, _, _, mut node)) = q.get_mut(target)
+                    && let Some(img) = node.image_mut()
+                {
+                    let before = img.data.strokes_hidden;
+                    img.data.strokes_hidden = !before;
+                    undo.push(UndoEntry::StrokeVis {
+                        entity: target,
+                        before,
+                        after: !before,
+                    });
+                }
+            }
+            MenuAction::EditText => {
+                if let Some(target) = menu.node {
+                    menu.pending = Some(PendingMenu::EditText(target));
+                }
+            }
+            MenuAction::AddLabel => {
+                menu.pending = Some(PendingMenu::AddLabel(menu.world));
+            }
+            MenuAction::TextColor(color) => {
+                if let Some(target) = menu.node {
+                    menu.pending = Some(PendingMenu::TextColor(target, color));
                 }
             }
             MenuAction::Delete => {
@@ -745,6 +894,90 @@ fn file_uri(path: &std::path::Path) -> String {
         }
     }
     uri
+}
+
+fn drain_menu_pending(
+    mut menu: ResMut<ContextMenu>,
+    mut editor: ResMut<crate::canvas::link::LinkEditor>,
+    mut text_edit: ResMut<crate::canvas::text::TextEdit>,
+    tool: Res<crate::canvas::draw::DrawTool>,
+    mut commands: Commands,
+    mut zc: ResMut<ZCounter>,
+    mut undo: ResMut<UndoStack>,
+    mut selection: ResMut<Selection>,
+    tabs: Res<Tabs>,
+    mut q: NodeQ,
+) {
+    let Some(pending) = menu.pending.take() else {
+        return;
+    };
+    let pos = menu.pos;
+    match pending {
+        PendingMenu::EditLink(entity) => {
+            let current = q
+                .get(entity)
+                .ok()
+                .and_then(|(_, _, _, node)| node.link.clone())
+                .unwrap_or_default();
+            editor.entity = Some(entity);
+            editor.before = if current.is_empty() {
+                None
+            } else {
+                Some(current.clone())
+            };
+            editor.text = current;
+            editor.pos = pos;
+            editor.focus_me = true;
+            editor.had_focus = false;
+        }
+        PendingMenu::EditText(entity) => {
+            if let Ok((_, _, _, node)) = q.get(entity)
+                && let NodeKind::Text(text) = &node.kind
+            {
+                text_edit.target = Some(entity);
+                text_edit.text = text.body.clone();
+                text_edit.focus_me = true;
+                text_edit.had_focus = false;
+                selection.nodes = vec![entity];
+            }
+        }
+        PendingMenu::AddLabel(world) => {
+            let tab_id = tabs.active_id().unwrap_or(0);
+            let entity = crate::canvas::text::create_text(
+                &mut commands,
+                &mut zc,
+                &mut undo,
+                tab_id,
+                world,
+                tool.color,
+                &mut text_edit,
+            );
+            selection.nodes = vec![entity];
+        }
+        PendingMenu::TextColor(entity, color) => {
+            if let Ok((_, _, _, mut node)) = q.get_mut(entity) {
+                let size = node.size;
+                let Some(text) = node.kind.text_mut() else {
+                    return;
+                };
+                if text.color == color {
+                    return;
+                }
+                let before_color = text.color;
+                let body = text.body.clone();
+                text.color = color;
+                undo.push(UndoEntry::TextBody {
+                    entity,
+                    before: body.clone(),
+                    after: body,
+                    before_color,
+                    after_color: color,
+                    before_size: size,
+                    after_size: size,
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1337,7 @@ fn hud(
     selection: Res<Selection>,
     queue: Res<ImportQueue>,
     update: Res<crate::update::UpdateStatus>,
+    notices: Res<crate::feedback::Notices>,
     real: Res<Time<Real>>,
     mut pacer: ResMut<crate::FramePacer>,
     mut fps: Local<FpsCounter>,
@@ -1220,6 +1454,14 @@ fn hud(
                 }
                 if let Some((done, total)) = queue.progress() {
                     ui.label(text(format!("importing {done}/{total}")));
+                }
+                if let Some(note) = notices.current(real.elapsed_secs()) {
+                    ui.label(
+                        egui::RichText::new(note)
+                            .monospace()
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(255, 180, 80)),
+                    );
                 }
             });
         });

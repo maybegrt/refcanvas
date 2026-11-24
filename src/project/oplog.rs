@@ -156,6 +156,34 @@ pub struct SavedNode {
     pub crop_w: Option<f32>,
     pub crop_h: Option<f32>,
     pub px_scale: Option<f32>,
+    /// `https://…` or an app scheme such as `notion://…`. Absent on old rows.
+    #[serde(default)]
+    pub link: Option<String>,
+    /// Page a web-imported image was downloaded from.
+    #[serde(default)]
+    pub source_url: Option<String>,
+    /// Palette index for text labels and free-standing strokes.
+    #[serde(default)]
+    pub color: Option<u8>,
+    /// Image doodles, or the single stroke of a `kind: "stroke"` node.
+    /// Points are texel space on an image and local space on a free stroke.
+    #[serde(default)]
+    pub strokes: Vec<SavedStroke>,
+    /// Image-only: hide this image's doodles without deleting them.
+    #[serde(default)]
+    pub strokes_hidden: bool,
+    /// Free-stroke local space the points were authored in. The node's `w`/`h`
+    /// are the current (possibly scaled) size.
+    #[serde(default)]
+    pub stroke_space: Option<[f32; 2]>,
+}
+
+/// One stored doodle. `pts` is a list of `[x, y]` in the stroke's local space.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SavedStroke {
+    pub pts: Vec<[f32; 2]>,
+    pub color: u8,
+    pub width: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -986,6 +1014,126 @@ mod tests {
         std::fs::write(&path, complete).unwrap();
         read_project(&root, &mut state, &mut marks).unwrap();
         assert_eq!(state.nodes.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_image_json_without_new_fields_still_loads() {
+        let json = r#"{"kind":"image","x":1.0,"y":2.0,"w":3.0,"h":4.0,"rot":0.0,"z":1.0,"src":"images/a.png","flip_x":false,"flip_y":false}"#;
+        let node: SavedNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.kind, "image");
+        assert!(node.link.is_none());
+        assert!(node.source_url.is_none());
+        assert!(node.strokes.is_empty());
+        assert!(!node.strokes_hidden);
+        assert!(node.color.is_none());
+        assert!(node.stroke_space.is_none());
+    }
+
+    #[test]
+    fn text_stroke_and_attached_ink_round_trip_through_the_journal() {
+        let root = std::env::temp_dir().join(format!(
+            "refcanvas-oplog-kinds-{}-{}",
+            std::process::id(),
+            NONCE.load(Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("checkpoints")).unwrap();
+        let mut journal = Journal::create(&root.join("journal"), "dev").unwrap();
+        let mut clock = clock("dev");
+
+        let text_id = Uuid::now_v7();
+        let stroke_id = Uuid::now_v7();
+        let image_id = Uuid::now_v7();
+        let text = SavedNode {
+            kind: "text".into(),
+            x: 10.0,
+            y: 20.0,
+            w: 80.0,
+            h: 36.0,
+            z: 3.0,
+            label: Some("cluster A\nline 2".into()),
+            color: Some(15),
+            link: Some("notion://page".into()),
+            ..Default::default()
+        };
+        let stroke = SavedNode {
+            kind: "stroke".into(),
+            x: 1.0,
+            y: 2.0,
+            w: 30.0,
+            h: 10.0,
+            rot: 0.5,
+            z: 4.0,
+            color: Some(9),
+            strokes: vec![SavedStroke {
+                pts: vec![[0.0, 0.0], [10.0, 4.0], [20.0, 0.0]],
+                color: 9,
+                width: 2.0,
+            }],
+            stroke_space: Some([30.0, 10.0]),
+            ..Default::default()
+        };
+        let image = SavedNode {
+            kind: "image".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 80.0,
+            z: 1.0,
+            src: Some("images/ab.png".into()),
+            hash: Some("ab".into()),
+            img_w: Some(100),
+            img_h: Some(80),
+            source_url: Some("https://cdn.example/ab.png".into()),
+            strokes_hidden: true,
+            link: Some("https://www.notion.so/ref".into()),
+            strokes: vec![SavedStroke {
+                pts: vec![[5.0, 6.0], [15.0, 16.0]],
+                color: 12,
+                width: 3.0,
+            }],
+            ..Default::default()
+        };
+
+        journal
+            .append(vec![
+                Op {
+                    id: text_id,
+                    rev: clock.tick(),
+                    deleted: false,
+                    node: Some(text.clone()),
+                },
+                Op {
+                    id: stroke_id,
+                    rev: clock.tick(),
+                    deleted: false,
+                    node: Some(stroke.clone()),
+                },
+                Op {
+                    id: image_id,
+                    rev: clock.tick(),
+                    deleted: false,
+                    node: Some(image.clone()),
+                },
+            ])
+            .unwrap();
+        drop(journal);
+
+        let mut state = MergeState::default();
+        let mut marks = HashMap::new();
+        read_project(&root, &mut state, &mut marks).unwrap();
+        assert_eq!(state.nodes[&text_id].node.clone().unwrap(), text);
+        assert_eq!(state.nodes[&stroke_id].node.clone().unwrap(), stroke);
+        assert_eq!(state.nodes[&image_id].node.clone().unwrap(), image);
+        assert_eq!(
+            state.nodes[&image_id].node.as_ref().unwrap().strokes[0].pts,
+            vec![[5.0, 6.0], [15.0, 16.0]]
+        );
+
+        // A second read is a no-op: the journal mark covers the lines.
+        let changes = read_project(&root, &mut state, &mut marks).unwrap();
+        assert!(changes.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

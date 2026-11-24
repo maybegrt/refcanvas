@@ -3,6 +3,7 @@
 mod canvas;
 mod clipboard;
 mod dialogs;
+mod feedback;
 mod instance;
 mod project;
 mod theme;
@@ -89,9 +90,7 @@ fn prefer_x11_for_always_on_top() {
         let number = rest.split('.').next().unwrap_or("0");
         let socket = format!("/tmp/.X11-unix/X{number}");
         if !std::path::Path::new(&socket).exists() {
-            eprintln!(
-                "refcanvas: always-on-top needs X11 compatibility, but {socket} is missing"
-            );
+            eprintln!("refcanvas: always-on-top needs X11 compatibility, but {socket} is missing");
             return;
         }
     }

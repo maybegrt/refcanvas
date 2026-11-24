@@ -11,8 +11,10 @@
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 
-use super::manipulate::{current_pose, set_pose, ZCounter};
-use super::node::{CanvasNode, ImageData, ImageNode, NodeKind, NodeSnapshot, TabOwner};
+use super::manipulate::{ZCounter, current_pose, set_pose};
+use super::node::{
+    CanvasNode, ImageData, ImageNode, ImageStroke, NodeKind, NodeSnapshot, StrokeNode, TabOwner,
+};
 use super::selection::NodeQ;
 use crate::project::tabs::Tabs;
 
@@ -20,14 +22,24 @@ use crate::project::tabs::Tabs;
 pub enum NodeData {
     Image(ImageData),
     Frame { label: String },
+    Text { body: String, color: u8 },
+    Stroke(StrokeNode),
 }
 
 /// A node as it exists (or existed) on the canvas.
 pub struct NodeRecord {
     pub entity: Entity,
     pub tab_id: u64,
+    pub link: Option<String>,
     pub data: NodeData,
     pub snap: NodeSnapshot,
+}
+
+/// Attached-stroke list before and after an edit, for one image.
+pub struct InkSnapshot {
+    pub entity: Entity,
+    pub before: Vec<ImageStroke>,
+    pub after: Vec<ImageStroke>,
 }
 
 pub enum UndoEntry {
@@ -39,6 +51,33 @@ pub enum UndoEntry {
     Added { items: Vec<NodeRecord> },
     /// Nodes were removed (gone now): undo re-adds them, redo removes.
     Removed { items: Vec<NodeRecord> },
+    /// Attached strokes changed, and/or free-standing strokes were removed.
+    Ink {
+        images: Vec<InkSnapshot>,
+        removed: Vec<NodeRecord>,
+    },
+    /// Per-image "hide strokes" toggle.
+    StrokeVis {
+        entity: Entity,
+        before: bool,
+        after: bool,
+    },
+    /// Text label contents or palette color. Sizes are the node box.
+    TextBody {
+        entity: Entity,
+        before: String,
+        after: String,
+        before_color: u8,
+        after_color: u8,
+        before_size: Vec2,
+        after_size: Vec2,
+    },
+    /// Optional link on any node.
+    Link {
+        entity: Entity,
+        before: Option<String>,
+        after: Option<String>,
+    },
 }
 
 #[derive(Resource, Default)]
@@ -118,6 +157,7 @@ fn respawn(
                         }),
                         size: record.snap.pose.size,
                         rotation: record.snap.pose.rot,
+                        link: record.link.clone(),
                     },
                     Sprite {
                         image: preview,
@@ -159,6 +199,29 @@ fn respawn(
             label.clone(),
             record.snap.pose,
             record.snap.z,
+            record.link.clone(),
+        ),
+        NodeData::Text { body, color } => super::text::spawn_text(
+            commands,
+            record.tab_id,
+            visible,
+            None,
+            body.clone(),
+            *color,
+            record.snap.pose,
+            record.snap.z,
+            record.link.clone(),
+            true,
+        ),
+        NodeData::Stroke(stroke) => super::ink::spawn_stroke_node(
+            commands,
+            record.tab_id,
+            visible,
+            None,
+            stroke.clone(),
+            record.snap.pose,
+            record.snap.z,
+            record.link.clone(),
         ),
     };
     // Keep the z counter above everything we restore.
@@ -166,11 +229,7 @@ fn respawn(
     entity
 }
 
-pub fn records_of(
-    entities: &[Entity],
-    active_tab: u64,
-    q: &NodeQ,
-) -> Vec<NodeRecord> {
+pub fn records_of(entities: &[Entity], active_tab: u64, q: &NodeQ) -> Vec<NodeRecord> {
     entities
         .iter()
         .filter_map(|e| {
@@ -180,10 +239,16 @@ pub fn records_of(
                 NodeKind::Frame(frame) => NodeData::Frame {
                     label: frame.label.clone(),
                 },
+                NodeKind::Text(text) => NodeData::Text {
+                    body: text.body.clone(),
+                    color: text.color,
+                },
+                NodeKind::Stroke(stroke) => NodeData::Stroke(stroke.clone()),
             };
             Some(NodeRecord {
                 entity: *e,
                 tab_id: active_tab,
+                link: node.link.clone(),
                 data,
                 snap: snapshot_of(tf, node, sprite),
             })
@@ -293,6 +358,108 @@ fn apply(
                 }
             }
             UndoEntry::Removed { items }
+        }
+        UndoEntry::Ink {
+            images,
+            mut removed,
+        } => {
+            if undoing {
+                for snap in &images {
+                    if let Ok((_, _, _, mut node)) = q.get_mut(snap.entity)
+                        && let Some(img) = node.image_mut()
+                    {
+                        img.data.strokes = snap.before.clone();
+                    }
+                }
+                for record in &mut removed {
+                    record.entity = respawn(commands, zc, record, record.tab_id == *active_tab);
+                }
+            } else {
+                for snap in &images {
+                    if let Ok((_, _, _, mut node)) = q.get_mut(snap.entity)
+                        && let Some(img) = node.image_mut()
+                    {
+                        img.data.strokes = snap.after.clone();
+                    }
+                }
+                for record in &removed {
+                    if q.get(record.entity).is_ok() {
+                        commands.entity(record.entity).despawn();
+                    }
+                }
+            }
+            UndoEntry::Ink { images, removed }
+        }
+        UndoEntry::StrokeVis {
+            entity,
+            before,
+            after,
+        } => {
+            let hidden = if undoing { before } else { after };
+            if let Ok((_, _, _, mut node)) = q.get_mut(entity)
+                && let Some(img) = node.image_mut()
+            {
+                img.data.strokes_hidden = hidden;
+            }
+            UndoEntry::StrokeVis {
+                entity,
+                before,
+                after,
+            }
+        }
+        UndoEntry::TextBody {
+            entity,
+            before,
+            after,
+            before_color,
+            after_color,
+            before_size,
+            after_size,
+        } => {
+            let (body, color, size) = if undoing {
+                (before.clone(), before_color, before_size)
+            } else {
+                (after.clone(), after_color, after_size)
+            };
+            if let Ok((_, _, mut sprite, mut node)) = q.get_mut(entity)
+                && let Some(text) = node.kind.text_mut()
+            {
+                text.body = body;
+                text.color = color;
+                text.revision = text.revision.wrapping_add(1);
+                text.fitted_revision = text.revision;
+                text.fit_wait = 0;
+                node.size = size;
+                sprite.custom_size = Some(size);
+            }
+            UndoEntry::TextBody {
+                entity,
+                before,
+                after,
+                before_color,
+                after_color,
+                before_size,
+                after_size,
+            }
+        }
+        UndoEntry::Link {
+            entity,
+            before,
+            after,
+        } => {
+            let value = if undoing {
+                before.clone()
+            } else {
+                after.clone()
+            };
+            if let Ok((_, _, _, mut node)) = q.get_mut(entity) {
+                node.link = value;
+            }
+            UndoEntry::Link {
+                entity,
+                before,
+                after,
+            }
         }
     }
 }

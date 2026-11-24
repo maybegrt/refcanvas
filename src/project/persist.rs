@@ -220,6 +220,53 @@ pub fn spawn_saved_node(
                 rot: saved.rot,
             },
             saved.z,
+            saved.link.clone(),
+        ));
+    }
+    if saved.kind == "text" {
+        return Some(crate::canvas::text::spawn_text(
+            commands,
+            tab_id,
+            visible,
+            Some(id),
+            saved.label.clone().unwrap_or_else(|| "Label".to_string()),
+            crate::canvas::palette::clamp_index(saved.color.unwrap_or(15)),
+            Pose {
+                center: Vec2::new(saved.x, saved.y),
+                size: Vec2::new(saved.w.max(8.0), saved.h.max(8.0)),
+                rot: saved.rot,
+            },
+            saved.z,
+            saved.link.clone(),
+            true,
+        ));
+    }
+    if saved.kind == "stroke" {
+        let Some(stored) = saved.strokes.first() else {
+            return None;
+        };
+        let space = saved
+            .stroke_space
+            .map(|s| Vec2::new(s[0].max(1e-3), s[1].max(1e-3)))
+            .unwrap_or_else(|| Vec2::new(saved.w.max(1.0), saved.h.max(1.0)));
+        return Some(crate::canvas::ink::spawn_stroke_node(
+            commands,
+            tab_id,
+            visible,
+            Some(id),
+            crate::canvas::node::StrokeNode {
+                points: stored.pts.iter().map(|p| Vec2::new(p[0], p[1])).collect(),
+                width: stored.width.max(0.05),
+                color: crate::canvas::palette::clamp_index(stored.color),
+                space,
+            },
+            Pose {
+                center: Vec2::new(saved.x, saved.y),
+                size: Vec2::new(saved.w.max(1.0), saved.h.max(1.0)),
+                rot: saved.rot,
+            },
+            saved.z,
+            saved.link.clone(),
         ));
     }
     if saved.kind != "image" {
@@ -269,6 +316,17 @@ pub fn spawn_saved_node(
         preview_pending: true,
         crop,
         px_scale,
+        source_url: saved.source_url.clone(),
+        strokes: saved
+            .strokes
+            .iter()
+            .map(|stroke| crate::canvas::node::ImageStroke {
+                points: stroke.pts.iter().map(|p| Vec2::new(p[0], p[1])).collect(),
+                width: stroke.width,
+                color: stroke.color,
+            })
+            .collect(),
+        strokes_hidden: saved.strokes_hidden,
     };
 
     let entity = commands
@@ -287,6 +345,7 @@ pub fn spawn_saved_node(
                 }),
                 size: pose.size,
                 rotation: pose.rot,
+                link: saved.link.clone(),
             },
             Sprite {
                 image: placeholder.clone(),
@@ -431,6 +490,21 @@ pub(crate) fn normalize_saved(mut saved: SavedNode) -> SavedNode {
         }
         return saved;
     }
+    if saved.kind == "text" {
+        if saved.label.as_deref().unwrap_or("").is_empty() {
+            saved.label = Some("Label".to_string());
+        }
+        saved.color = Some(crate::canvas::palette::clamp_index(
+            saved.color.unwrap_or(15),
+        ));
+        return saved;
+    }
+    if saved.kind == "stroke" {
+        if saved.stroke_space.is_none() {
+            saved.stroke_space = Some([saved.w.max(1.0), saved.h.max(1.0)]);
+        }
+        return saved;
+    }
     if saved.kind != "image" {
         return saved;
     }
@@ -461,52 +535,67 @@ pub(crate) fn normalize_saved(mut saved: SavedNode) -> SavedNode {
 }
 
 pub(crate) fn saved_from(tf: &Transform, node: &CanvasNode, sprite: &Sprite) -> SavedNode {
-    let (src, orig_name, hash, img_w, img_h, kind, label, crop, px_scale) = match &node.kind {
-        NodeKind::Image(img) => (
-            Some(img.data.rel_path.clone()),
-            Some(img.data.orig_name.clone()),
-            Some(img.data.hash.clone()),
-            Some(img.data.natural.x as i64),
-            Some(img.data.natural.y as i64),
-            "image",
-            None,
-            Some(img.data.crop),
-            Some(img.data.px_scale),
-        ),
-        NodeKind::Frame(frame) => (
-            None,
-            None,
-            None,
-            None,
-            None,
-            "frame",
-            Some(frame.label.clone()),
-            None,
-            None,
-        ),
-    };
-    SavedNode {
-        kind: kind.to_string(),
+    use crate::project::oplog::SavedStroke;
+
+    let mut saved = SavedNode {
         x: tf.translation.x,
         y: tf.translation.y,
         w: node.size.x,
         h: node.size.y,
         rot: node.rotation,
         z: tf.translation.z,
-        src,
-        orig_name,
-        hash,
-        img_w,
-        img_h,
         flip_x: sprite.flip_x,
         flip_y: sprite.flip_y,
-        label,
-        crop_x: crop.map(|c| c.min.x),
-        crop_y: crop.map(|c| c.min.y),
-        crop_w: crop.map(|c| c.size().x),
-        crop_h: crop.map(|c| c.size().y),
-        px_scale,
+        link: node.link.clone(),
+        ..Default::default()
+    };
+    match &node.kind {
+        NodeKind::Image(img) => {
+            saved.kind = "image".to_string();
+            saved.src = Some(img.data.rel_path.clone());
+            saved.orig_name = Some(img.data.orig_name.clone());
+            saved.hash = Some(img.data.hash.clone());
+            saved.img_w = Some(img.data.natural.x as i64);
+            saved.img_h = Some(img.data.natural.y as i64);
+            saved.crop_x = Some(img.data.crop.min.x);
+            saved.crop_y = Some(img.data.crop.min.y);
+            saved.crop_w = Some(img.data.crop.width());
+            saved.crop_h = Some(img.data.crop.height());
+            saved.px_scale = Some(img.data.px_scale);
+            saved.source_url = img.data.source_url.clone();
+            saved.strokes_hidden = img.data.strokes_hidden;
+            saved.strokes = img
+                .data
+                .strokes
+                .iter()
+                .map(|stroke| SavedStroke {
+                    pts: stroke.points.iter().map(|p| [p.x, p.y]).collect(),
+                    color: stroke.color,
+                    width: stroke.width,
+                })
+                .collect();
+        }
+        NodeKind::Frame(frame) => {
+            saved.kind = "frame".to_string();
+            saved.label = Some(frame.label.clone());
+        }
+        NodeKind::Text(text) => {
+            saved.kind = "text".to_string();
+            saved.label = Some(text.body.clone());
+            saved.color = Some(text.color);
+        }
+        NodeKind::Stroke(stroke) => {
+            saved.kind = "stroke".to_string();
+            saved.color = Some(stroke.color);
+            saved.stroke_space = Some([stroke.space.x, stroke.space.y]);
+            saved.strokes = vec![SavedStroke {
+                pts: stroke.points.iter().map(|p| [p.x, p.y]).collect(),
+                color: stroke.color,
+                width: stroke.width,
+            }];
+        }
     }
+    saved
 }
 
 /// Periodic autosave of the active tab plus a throttled local camera write.

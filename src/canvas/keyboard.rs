@@ -27,6 +27,8 @@ pub struct ShortcutCtx<'w> {
     pub undo: ResMut<'w, UndoStack>,
     pub grid_fade: ResMut<'w, GridFade>,
     pub tabs: Res<'w, Tabs>,
+    pub tool: ResMut<'w, super::draw::DrawTool>,
+    pub text_edit: ResMut<'w, super::text::TextEdit>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -139,13 +141,42 @@ pub fn shortcuts(
         *ctx.interaction = Interaction::Idle;
     }
 
-    // ---- Escape: cancel the current drag (restoring state) or deselect ----
+    // ---- Escape: leave the brush/eraser, else cancel the drag or deselect ----
     if keys.just_pressed(KeyCode::Escape) {
-        if ctx.interaction.is_idle() {
+        if ctx.tool.tool != super::draw::Tool::Select {
+            ctx.tool.tool = super::draw::Tool::Select;
+        } else if ctx.interaction.is_idle() {
             ctx.selection.clear();
         } else {
             selection::cancel_interaction(&mut ctx.interaction, &mut q);
         }
+    }
+
+    if !ctrl && keys.just_pressed(KeyCode::KeyB) {
+        ctx.tool.tool = super::draw::Tool::Brush;
+    }
+    if !ctrl && keys.just_pressed(KeyCode::KeyE) {
+        ctx.tool.tool = super::draw::Tool::Eraser;
+    }
+    if !ctrl && keys.just_pressed(KeyCode::KeyV) {
+        ctx.tool.tool = super::draw::Tool::Select;
+    }
+    if !ctrl && keys.just_pressed(KeyCode::KeyT) {
+        let at = window
+            .cursor_position()
+            .and_then(|c| camera.0.viewport_to_world_2d(camera.1, c).ok())
+            .unwrap_or_else(|| ctx.view.center.as_vec2());
+        let tab_id = ctx.tabs.active_id().unwrap_or(0);
+        let entity = super::text::create_text(
+            &mut commands,
+            &mut ctx.zc,
+            &mut ctx.undo,
+            tab_id,
+            at,
+            ctx.tool.color,
+            &mut ctx.text_edit,
+        );
+        ctx.selection.nodes = vec![entity];
     }
 
     // ---- Selection & clipboard ----
@@ -215,7 +246,16 @@ pub fn shortcuts(
             let z = min_z.min(ctx.zc.0) - 0.5;
             let tab_id = ctx.tabs.active_id().unwrap_or(0);
             let label = "Frame".to_string();
-            let e = frames::spawn_frame(&mut commands, tab_id, true, None, label.clone(), pose, z);
+            let e = frames::spawn_frame(
+                &mut commands,
+                tab_id,
+                true,
+                None,
+                label.clone(),
+                pose,
+                z,
+                None,
+            );
             // Keep the previous selection (the framed nodes) instead of
             // selecting the new frame: the selection outline + handles are
             // drawn right at the frame's border, which with the tight padding
@@ -225,6 +265,7 @@ pub fn shortcuts(
                 items: vec![NodeRecord {
                     entity: e,
                     tab_id,
+                    link: None,
                     data: NodeData::Frame { label },
                     snap: NodeSnapshot {
                         pose,
@@ -315,7 +356,7 @@ fn ray_vote(
     // Nearest hit per sample ray: (entry distance, z, entity).
     let mut nearest: Vec<Option<(f32, f32, Entity)>> = vec![None; ARROW_RAYS];
     for (e, tf, _, node) in q.iter() {
-        if e == current || !keep(e) || node.kind.is_frame() {
+        if e == current || !keep(e) || node.kind.is_frame() || node.kind.is_stroke() {
             continue;
         }
         let r = hit::aabb_of(&manipulate::current_pose(tf, node));

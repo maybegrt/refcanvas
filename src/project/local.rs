@@ -137,37 +137,67 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) {
 // Window preferences
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct UiPrefs {
     #[serde(default)]
     always_on_top: bool,
+    /// Corner button. Missing on older installs means strokes stay visible.
+    #[serde(default = "default_show_strokes")]
+    show_strokes: bool,
+}
+
+fn default_show_strokes() -> bool {
+    true
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            always_on_top: false,
+            show_strokes: true,
+        }
+    }
 }
 
 fn prefs_path() -> Option<PathBuf> {
     data_root().map(|root| root.join("ui.json"))
 }
 
-pub fn load_always_on_top() -> bool {
+fn load_prefs() -> UiPrefs {
     let Some(path) = prefs_path() else {
-        return false;
+        return UiPrefs::default();
     };
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<UiPrefs>(&bytes).ok())
-        .map(|prefs| prefs.always_on_top)
-        .unwrap_or(false)
+        .unwrap_or_default()
 }
 
-pub fn save_always_on_top(on_top: bool) {
+fn save_prefs(prefs: &UiPrefs) {
     let Some(path) = prefs_path() else {
         return;
     };
-    write_json(
-        &path,
-        &UiPrefs {
-            always_on_top: on_top,
-        },
-    );
+    write_json(&path, prefs);
+}
+
+pub fn load_always_on_top() -> bool {
+    load_prefs().always_on_top
+}
+
+pub fn save_always_on_top(on_top: bool) {
+    let mut prefs = load_prefs();
+    prefs.always_on_top = on_top;
+    save_prefs(&prefs);
+}
+
+pub fn load_show_strokes() -> bool {
+    load_prefs().show_strokes
+}
+
+pub fn save_show_strokes(show: bool) {
+    let mut prefs = load_prefs();
+    prefs.show_strokes = show;
+    save_prefs(&prefs);
 }
 
 // ---------------------------------------------------------------------------

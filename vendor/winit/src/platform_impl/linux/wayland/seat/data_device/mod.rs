@@ -9,19 +9,28 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy, QueueHandle};
 
 use crate::event::WindowEvent;
+use crate::platform_impl::wayland::seat::DroppedItem;
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::types::dnd::DndOfferState;
 use crate::platform_impl::wayland::{self};
 
-const SUPPORTED_MIME_TYPES: &[&str] = &["text/uri-list"];
+/// Prefer a uri-list. Plain text is the fallback some browsers offer when
+/// they will not send `text/uri-list` (a page URL dragged from the address
+/// bar, for example).
+const PREFERRED_MIME_TYPES: &[&str] = &[
+    "text/uri-list",
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "text/x-moz-url",
+    "URL",
+];
 
 fn filter_mime(mime_types: &[String]) -> Option<String> {
-    for mime in mime_types {
-        if SUPPORTED_MIME_TYPES.contains(&mime.as_str()) {
-            return Some(mime.clone());
+    for preferred in PREFERRED_MIME_TYPES {
+        if mime_types.iter().any(|mime| mime == preferred) {
+            return Some((*preferred).to_string());
         }
     }
-
     None
 }
 
@@ -48,20 +57,25 @@ impl DataDeviceHandler for WinitState {
                         let surface = offer.surface;
                         let window_id = wayland::make_wid(&surface);
 
-                        self.read_file_paths(read_pipe, move |state, path| {
-                            state
+                        self.read_file_paths(read_pipe, move |state, item| {
+                            let offer = state
                                 .dnd_offers
                                 .entry(data_device_id.clone())
                                 .or_insert_with(|| DndOfferState {
                                     surface: surface.clone(),
                                     paths: Vec::new(),
-                                })
-                                .paths
-                                .push(path.clone());
-
-                            state
-                                .events_sink
-                                .push_window_event(WindowEvent::HoveredFile(path), window_id);
+                                    urls: Vec::new(),
+                                });
+                            match item {
+                                DroppedItem::Path(path) => {
+                                    offer.paths.push(path.clone());
+                                    state.events_sink.push_window_event(
+                                        WindowEvent::HoveredFile(path),
+                                        window_id,
+                                    );
+                                }
+                                DroppedItem::Url(url) => offer.urls.push(url),
+                            }
                         });
                     }
                 }
@@ -124,6 +138,9 @@ impl DataDeviceHandler for WinitState {
                     for path in dnd_offer.paths {
                         self.events_sink
                             .push_window_event(WindowEvent::DroppedFile(path), window_id);
+                    }
+                    for url in dnd_offer.urls {
+                        crate::dropped_text::push(url);
                     }
 
                     offer.finish();

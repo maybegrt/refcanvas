@@ -47,6 +47,7 @@ pub fn load(path: &Path) -> Result<Vec<(i64, SavedNode)>> {
                     crop_w: row.get(18)?,
                     crop_h: row.get(19)?,
                     px_scale: row.get(20)?,
+                    ..Default::default()
                 },
             ))
         })?

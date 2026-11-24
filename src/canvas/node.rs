@@ -38,6 +38,38 @@ pub struct NodeSnapshot {
     pub px_scale: f32,
 }
 
+/// One doodle stroke stored on an image, in full-image texel space (origin
+/// top-left, y down). `width` is in texels, so the ink scales with the image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageStroke {
+    pub points: Vec<Vec2>,
+    pub width: f32,
+    pub color: u8,
+}
+
+/// A free-standing doodle. Points are in the node's local space (y up, origin
+/// at the center) measured in `space` units. The live [`CanvasNode::size`]
+/// scales that space, so the transform gizmos resize the stroke.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeNode {
+    pub points: Vec<Vec2>,
+    pub width: f32,
+    pub color: u8,
+    pub space: Vec2,
+}
+
+/// A short label. `revision` bumps when the text changes; `fitted_revision`
+/// is the revision whose layout has already been turned into `CanvasNode::size`.
+/// `fit_wait` lets a fresh layout land before that measurement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextNode {
+    pub body: String,
+    pub color: u8,
+    pub revision: u64,
+    pub fitted_revision: u64,
+    pub fit_wait: u8,
+}
+
 #[derive(Component)]
 pub struct CanvasNode {
     /// Stable operation-log id; `None` until first persisted.
@@ -47,11 +79,15 @@ pub struct CanvasNode {
     pub size: Vec2,
     /// Z rotation in radians.
     pub rotation: f32,
+    /// Optional link opened with the OS handler (`https://…`, `notion://…`).
+    pub link: Option<String>,
 }
 
 pub enum NodeKind {
     Image(ImageNode),
     Frame(FrameNode),
+    Text(TextNode),
+    Stroke(StrokeNode),
 }
 
 /// A labeled container. Dragging it moves the image nodes it contains.
@@ -93,6 +129,12 @@ pub struct ImageData {
     pub crop: Rect,
     /// Display scale: world units per source texel (uniform).
     pub px_scale: f32,
+    /// Page the pixels were downloaded from, when they came from a URL.
+    pub source_url: Option<String>,
+    /// Doodles attached to this image, in full-image texel space.
+    pub strokes: Vec<ImageStroke>,
+    /// Per-image "hide strokes" toggle. Hidden strokes stay stored.
+    pub strokes_hidden: bool,
 }
 
 impl ImageData {
@@ -115,7 +157,12 @@ impl ImageData {
     /// preview textures are downscaled (see `preview_size`), so the crop must
     /// be scaled to match, otherwise the sprite samples outside the texture
     /// and shows a stretched sliver of the image.
-    pub fn tier_rect_of(crop: Rect, natural: UVec2, preview_size: UVec2, full_active: bool) -> Rect {
+    pub fn tier_rect_of(
+        crop: Rect,
+        natural: UVec2,
+        preview_size: UVec2,
+        full_active: bool,
+    ) -> Rect {
         let natural = natural.as_vec2().max(Vec2::ONE);
         let preview = preview_size.as_vec2().max(Vec2::ONE);
         if full_active || preview == natural {
@@ -189,14 +236,21 @@ impl NodeKind {
     pub fn image(&self) -> Option<&ImageNode> {
         match self {
             NodeKind::Image(img) => Some(img),
-            NodeKind::Frame(_) => None,
+            _ => None,
         }
     }
 
     pub fn image_mut(&mut self) -> Option<&mut ImageNode> {
         match self {
             NodeKind::Image(img) => Some(img),
-            NodeKind::Frame(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self) -> Option<&mut TextNode> {
+        match self {
+            NodeKind::Text(text) => Some(text),
+            _ => None,
         }
     }
 
@@ -204,11 +258,20 @@ impl NodeKind {
         matches!(self, NodeKind::Frame(_))
     }
 
+    pub fn is_text(&self) -> bool {
+        matches!(self, NodeKind::Text(_))
+    }
+
+    pub fn is_stroke(&self) -> bool {
+        matches!(self, NodeKind::Stroke(_))
+    }
+
     #[allow(dead_code)]
     pub fn label(&self) -> Option<&str> {
         match self {
             NodeKind::Frame(frame) => Some(&frame.label),
-            NodeKind::Image(_) => None,
+            NodeKind::Text(text) => Some(&text.body),
+            _ => None,
         }
     }
 }
